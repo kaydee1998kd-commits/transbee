@@ -1,10 +1,141 @@
-            - name: Expo-Unsigned-IPA
-  # You may pin to the exact commit or the version.
-  # uses: gamekiller2048/Expo-Unsigned-IPA@4228e289556fca6253e400123b7e3d3832483541
-  uses: gamekiller2048/Expo-Unsigned-IPA@v1
-  with:
-    # name of expo project
-    PROJECT_NAME: 
-    # whether to clear the last cache
-    CLEAR_CACHE: # optional, default is false
+name: Build IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Bubble Translate IPA
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show project structure
+        run: |
+          echo "=== Project Structure ==="
+          find . -type f -not -path './.git/*' | sort
+          echo ""
+          echo "=== Swift source files ==="
+          find . -name "*.swift" -type f
+          echo ""
+          echo "=== Resource files ==="
+          find . -name "*.storyboard" -o -name "*.plist" | sort
+
+      - name: Install XcodeGen and ldid
+        run: |
+          brew install xcodegen ldid
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          echo "=== Generated project ==="
+          ls -la BubbleTranslate.xcodeproj/
+          echo ""
+          echo "=== pbxproj contents (source file refs) ==="
+          grep -c "\.swift" BubbleTranslate.xcodeproj/project.pbxproj || echo "NO SWIFT FILES FOUND IN PROJECT!"
+          grep "\.swift.*fileRef" BubbleTranslate.xcodeproj/project.pbxproj | head -20
+
+      - name: List available schemes
+        run: |
+          xcodebuild -list -project BubbleTranslate.xcodeproj
+
+      - name: Build app
+        run: |
+          echo "Building for iphoneos arm64..."
+          set -o pipefail
+          xcodebuild build \
+            -project BubbleTranslate.xcodeproj \
+            -scheme BubbleTranslate \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            -derivedDataPath build/DerivedData \
+            2>&1 | tee build_output.log
+
+      - name: Check build for errors
+        run: |
+          ERRORS=$(grep -c "error:" build_output.log || true)
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "❌ Found $ERRORS build errors:"
+            grep "error:" build_output.log
+            exit 1
+          fi
+
+      - name: Find and verify app bundle
+        run: |
+          APP_PATH=$(find build/DerivedData -name "BubbleTranslate.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ BubbleTranslate.app NOT FOUND!"
+            echo "Searching for any .app..."
+            find build/DerivedData -name "*.app" -type d || true
+            exit 1
+          fi
+          echo "✅ Found app at: $APP_PATH"
           
+          # List app contents
+          echo "=== App contents ==="
+          ls -la "$APP_PATH/"
+          
+          # Check binary
+          BINARY="$APP_PATH/BubbleTranslate"
+          if [ -f "$BINARY" ]; then
+            BINARY_SIZE=$(stat -f%z "$BINARY" 2>/dev/null || echo "0")
+            echo "Binary size: $BINARY_SIZE bytes"
+            if [ "$BINARY_SIZE" -lt 50000 ]; then
+              echo "⚠️  Binary is very small ($BINARY_SIZE bytes) - likely empty/failed build"
+              echo "Checking for Swift symbols..."
+              nm "$BINARY" 2>/dev/null | head -5 || echo "No symbols found"
+            else
+              echo "✅ Binary looks good ($BINARY_SIZE bytes)"
+            fi
+          else
+            echo "❌ Binary not found!"
+            exit 1
+          fi
+          
+          # Check for Swift modules
+          echo "=== Swift modules ==="
+          find "$APP_PATH" -name "*.swiftmodule" -type d || echo "No swift modules found"
+
+      - name: Create IPA
+        run: |
+          APP_PATH=$(find build/DerivedData -name "BubbleTranslate.app" -type d | head -1)
+          
+          mkdir -p build/Payload
+          cp -r "$APP_PATH" build/Payload/
+          
+          # Fake sign for jailbroken device
+          ldid -S build/Payload/BubbleTranslate.app/BubbleTranslate
+          
+          cd build
+          zip -r BubbleTranslate.ipa Payload/
+          cd ..
+          
+          IPA_SIZE=$(du -sh build/BubbleTranslate.ipa | cut -f1)
+          echo "✅ IPA created: build/BubbleTranslate.ipa ($IPA_SIZE)"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_output.log
+          retention-days: 7
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BubbleTranslate-IPA
+          path: build/BubbleTranslate.ipa
+          retention-days: 30
